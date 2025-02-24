@@ -1,8 +1,8 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "0.1",
-	"FriendlyName": "Virtual Heightfield Mesh",
+	"VersionName": "0.1_isr",
+	"FriendlyName": "Virtual Heightfield Mesh (ISR)",
 	"Description": "Mesh renderer for virtual texture heightfields",
 	"Category": "Rendering",
 	"CreatedBy": "Epic Games Inc.",
