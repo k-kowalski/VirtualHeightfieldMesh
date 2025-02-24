@@ -174,7 +174,7 @@ public:
 	void RegisterExtension();
 
 	/** Call once per frame for each mesh/view that has relevance. This allocates the buffers to use for the frame and adds the work to fill the buffers to the queue. */
-	VirtualHeightfieldMesh::FDrawInstanceBuffers& AddWork(FVirtualHeightfieldMeshSceneProxy const* InProxy, FSceneView const* InMainView, FSceneView const* InCullView);
+	VirtualHeightfieldMesh::FDrawInstanceBuffers& AddWork(FVirtualHeightfieldMeshSceneProxy const* InProxy, const TArray<const FSceneView*>& InViewFamilyViews, FSceneView const* InCullView);
 	/** Submit all the work added by AddWork(). The work fills all of the buffers ready for use by the referencing mesh batches. */
 	void SubmitWork(FRHICommandListImmediate& InRHICmdList);
 
@@ -201,8 +201,8 @@ private:
 
 	/** Arrary of uniqe scene proxies to render this frame. */
 	TArray<FVirtualHeightfieldMeshSceneProxy const*> SceneProxies;
-	/** Arrary of unique main views to render this frame. */
-	TArray<FSceneView const*> MainViews;
+	/** Arrary of unique view families to render this frame. */
+	TArray< TArray<FSceneView const*>> ViewFamilies;
 	/** Arrary of unique culling views to render this frame. */
 	TArray<FSceneView const*> CullViews;
 
@@ -252,7 +252,7 @@ void FVirtualHeightfieldMeshRendererExtension::ReleaseRHI()
 	Buffers.Empty();
 }
 
-VirtualHeightfieldMesh::FDrawInstanceBuffers& FVirtualHeightfieldMeshRendererExtension::AddWork(FVirtualHeightfieldMeshSceneProxy const* InProxy, FSceneView const* InMainView, FSceneView const* InCullView)
+VirtualHeightfieldMesh::FDrawInstanceBuffers& FVirtualHeightfieldMeshRendererExtension::AddWork(FVirtualHeightfieldMeshSceneProxy const* InProxy, const TArray<const FSceneView*>& InViewFamilyViews, FSceneView const* InCullView)
 {
 	// If we hit this then BegineFrame()/EndFrame() logic needs fixing in the Scene Renderer.
 	if (!ensure(!bInFrame))
@@ -263,7 +263,7 @@ VirtualHeightfieldMesh::FDrawInstanceBuffers& FVirtualHeightfieldMeshRendererExt
 	// Create workload
 	FWorkDesc WorkDesc;
 	WorkDesc.ProxyIndex = SceneProxies.AddUnique(InProxy);
-	WorkDesc.MainViewIndex = MainViews.AddUnique(InMainView);
+	WorkDesc.MainViewIndex = ViewFamilies.AddUnique(InViewFamilyViews);
 	WorkDesc.CullViewIndex = CullViews.AddUnique(InCullView);
 	WorkDesc.BufferIndex = -1;
 
@@ -325,7 +325,7 @@ void FVirtualHeightfieldMeshRendererExtension::EndFrame()
 	bInFrame = false;
 
 	SceneProxies.Reset();
-	MainViews.Reset();
+	ViewFamilies.Reset();
 	CullViews.Reset();
 	WorkDescs.Reset();
 
@@ -519,11 +519,33 @@ void FVirtualHeightfieldMeshSceneProxy::GetDynamicMeshElements(const TArray<cons
 	check(IsInRenderingThread());
 	check(AllocatedVirtualTexture != nullptr);
 
+	FSceneView const* MainView = ViewFamily.Views[0];
+	FVector MainViewOrigin = FVector::ZeroVector;
+	if (MainView->IsInstancedStereoPass())
+	{
+		// An average of eye positions
+		MainViewOrigin = 0.5f * (ViewFamily.Views[0]->ViewMatrices.GetViewOrigin() + ViewFamily.Views[1]->ViewMatrices.GetViewOrigin());
+	}
+	else
+	{
+		MainViewOrigin = MainView->ViewMatrices.GetViewOrigin();
+	}
+
 	for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ViewIndex++)
 	{
 		if (VisibilityMap & (1 << ViewIndex))
 		{
-			VirtualHeightfieldMesh::FDrawInstanceBuffers& Buffers = GVirtualHeightfieldMeshViewRendererExtension.AddWork(this, ViewFamily.Views[0], Views[ViewIndex]);
+			const FSceneView* View = Views[ViewIndex];
+			const bool bIsInstancedStereo = View->bIsInstancedStereoEnabled && IStereoRendering::IsStereoEyeView(*View);
+			const bool isPrimary = IStereoRendering::IsAPrimaryView(*View);
+			if (bIsInstancedStereo && !isPrimary)
+			{
+				// For the currently tested view!: skip non-primary, instanced stereo view
+				continue;
+			}
+
+
+			VirtualHeightfieldMesh::FDrawInstanceBuffers& Buffers = GVirtualHeightfieldMeshViewRendererExtension.AddWork(this, ViewFamily.Views, Views[ViewIndex]);
 
 			FMeshBatch& Mesh = Collector.AllocateMesh();
 			Mesh.bWireframe = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
@@ -560,8 +582,7 @@ void FVirtualHeightfieldMeshSceneProxy::GetDynamicMeshElements(const TArray<cons
 				UserData->InstanceBufferSRV = Buffers.InstanceBufferSRV;
 
 				//todo[vhm]: Move all the view dependent lod logic into shader. Would help us to move to static mesh batches in the future.
-				FSceneView const* MainView = ViewFamily.Views[0];
-				UserData->LodViewOrigin = MainView->ViewMatrices.GetViewOrigin();
+				UserData->LodViewOrigin = MainViewOrigin;
 
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
 				// Support the freezerendering mode. Use any frozen view state for culling.
@@ -571,7 +592,8 @@ void FVirtualHeightfieldMeshSceneProxy::GetDynamicMeshElements(const TArray<cons
 					UserData->LodViewOrigin = FrozenViewMatrices->GetViewOrigin();
 				}
 #endif
-
+				// (Instanced Stereo): one can safely use primary view to calculate ScreenMultiple factor (left eye proj matrix inside CalculateLodRanges),
+				// it should be identical for each non-primary view
 				UserData->LodDistances = VirtualHeightfieldMesh::CalculateLodRanges(MainView, this);
 			}
 
@@ -791,6 +813,11 @@ namespace VirtualHeightfieldMesh
 	class FCullInstances : public FGlobalShader
 	{
 	public:
+		enum Flags : uint32
+		{
+			Flag_InstancedStereo = 1 << 1,
+		};
+
 		SHADER_USE_PARAMETER_STRUCT(FCullInstances, FGlobalShader);
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
@@ -807,6 +834,7 @@ namespace VirtualHeightfieldMesh
 			SHADER_PARAMETER_UAV(RWStructuredBuffer<QuadRenderInstance>, RWInstanceBuffer)
 			SHADER_PARAMETER_UAV(RWBuffer<uint>, RWIndirectArgsBuffer)
 			SHADER_PARAMETER_RDG_BUFFER(Buffer<uint>, IndirectArgsBuffer)
+			SHADER_PARAMETER(uint32, CullInstancesWorkFlags)
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
@@ -878,10 +906,40 @@ namespace VirtualHeightfieldMesh
 	};
 
 	/** Fill the FViewData from an FSceneView respecting the freezerendering mode. */
-	void GetViewData(FSceneView const* InSceneView, FViewData& OutViewData)
+	void GetViewData(TArray<FSceneView const*> const & InSceneView, FViewData& OutViewData)
 	{
+		FSceneView const* MainView = InSceneView[0];
+		FVector MainViewOrigin = FVector::ZeroVector;
+		TArray<FPlane, TInlineAllocator<6>> FrustumPlanes;
+		FrustumPlanes.SetNumZeroed(5);
+
+		// Ignore near plane!
+		const FMatrix& ViewProj = MainView->ViewMatrices.GetViewProjectionMatrix();
+		ViewProj.GetFrustumFarPlane(FrustumPlanes[0]);
+		ViewProj.GetFrustumTopPlane(FrustumPlanes[1]);
+		ViewProj.GetFrustumBottomPlane(FrustumPlanes[2]);
+		ViewProj.GetFrustumLeftPlane(FrustumPlanes[3]);
+
+		if (MainView->IsInstancedStereoPass())
+		{
+			// Extend frustum to encompass the right eye
+			MainViewOrigin = 0.5f * (InSceneView[0]->ViewMatrices.GetViewOrigin() + InSceneView[1]->ViewMatrices.GetViewOrigin());
+
+			const FMatrix& ViewProjRight = InSceneView[1]->ViewMatrices.GetViewProjectionMatrix();
+
+			ViewProjRight.GetFrustumRightPlane(FrustumPlanes[4]);
+		}
+		else
+		{
+			MainViewOrigin = MainView->ViewMatrices.GetViewOrigin();
+			ViewProj.GetFrustumRightPlane(FrustumPlanes[4]);
+		}
+
+		FConvexVolume ViewFrustum(FrustumPlanes);
+
+
 #if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
-		const FViewMatrices* FrozenViewMatrices = InSceneView->State != nullptr ? InSceneView->State->GetFrozenViewMatrices() : nullptr;
+		const FViewMatrices* FrozenViewMatrices = MainView->State != nullptr ? MainView->State->GetFrozenViewMatrices() : nullptr;
 		if (FrozenViewMatrices != nullptr)
 		{
 			OutViewData.ViewOrigin = FrozenViewMatrices->GetViewOrigin();
@@ -892,9 +950,9 @@ namespace VirtualHeightfieldMesh
 		else
 #endif
 		{
-			OutViewData.ViewOrigin = InSceneView->ViewMatrices.GetViewOrigin();
-			OutViewData.ProjectionMatrix = InSceneView->ViewMatrices.GetProjectionMatrix();
-			OutViewData.ViewFrustum = InSceneView->ViewFrustum;
+			OutViewData.ViewOrigin = MainViewOrigin;
+			OutViewData.ProjectionMatrix = MainView->ViewMatrices.GetProjectionMatrix();
+			OutViewData.ViewFrustum = ViewFrustum;
 			OutViewData.bViewFrozen = false;
 		}
 	}
@@ -1148,7 +1206,7 @@ namespace VirtualHeightfieldMesh
 	}
 
 	/** Cull quads and write to the final output buffer. */
-	void AddPass_CullInstances(FRDGBuilder& GraphBuilder, FGlobalShaderMap* InGlobalShaderMap, FProxyDesc const& InDesc, FVolatileResources& InVolatileResources, FDrawInstanceBuffers& InOutputResources, FChildViewDesc const& InViewDesc)
+	void AddPass_CullInstances(FRDGBuilder& GraphBuilder, FGlobalShaderMap* InGlobalShaderMap, FProxyDesc const& InDesc, FVolatileResources& InVolatileResources, FDrawInstanceBuffers& InOutputResources, FChildViewDesc const& InViewDesc, bool IsInstancedStereoPass)
 	{
 		FCullInstances::FParameters* PassParameters = GraphBuilder.AllocParameters<FCullInstances::FParameters>();
 		PassParameters->HeightMinMaxTexture = InDesc.HeightMinMaxTexture;
@@ -1167,6 +1225,13 @@ namespace VirtualHeightfieldMesh
 		PassParameters->IndirectArgsBufferSRV = InVolatileResources.IndirectArgsBufferSRV;
 		PassParameters->RWInstanceBuffer = InOutputResources.InstanceBufferUAV;
 		PassParameters->RWIndirectArgsBuffer = InOutputResources.IndirectArgsBufferUAV;
+
+		uint32 CullInstancesWorkFlags = 0;
+		if (IsInstancedStereoPass)
+		{
+			CullInstancesWorkFlags |= FCullInstances::Flags::Flag_InstancedStereo;
+		}
+		PassParameters->CullInstancesWorkFlags = CullInstancesWorkFlags;
 
 		TShaderRef<FCullInstances> ComputeShader;
 		if (InViewDesc.bIsMainView)
@@ -1282,16 +1347,19 @@ void FVirtualHeightfieldMeshRendererExtension::SubmitWork(FRHICommandListImmedia
 			while (WorkIndex < NumWorkItems && SceneProxies[WorkDescs[WorkIndex].ProxyIndex] == Proxy)
 			{
 				// Gather data per main view
-				FSceneView const* MainView = MainViews[WorkDescs[WorkIndex].MainViewIndex];
+				TArray<FSceneView const*> ViewFamily = ViewFamilies[WorkDescs[WorkIndex].MainViewIndex];
+				FSceneView const* MainView = ViewFamily[0];
 				
 				VirtualHeightfieldMesh::FViewData MainViewData;
-				VirtualHeightfieldMesh::GetViewData(MainView, MainViewData);
+				VirtualHeightfieldMesh::GetViewData(ViewFamily, MainViewData);
 
 				VirtualHeightfieldMesh::FMainViewDesc MainViewDesc;
 				MainViewDesc.ViewDebug = MainView;
 
 				// ViewOrigin and Frustum Planes are all converted to UV space for the shader.
 				MainViewDesc.ViewOrigin = Proxy->WorldToUV.TransformPosition(MainViewData.ViewOrigin);
+				// (Instanced Stereo): one can safely use primary view to calculate ScreenMultiple factor (left eye proj matrix inside CalculateLodRanges),
+				// it should be identical for each non-primary view
 				MainViewDesc.LodDistances = VirtualHeightfieldMesh::CalculateLodRanges(MainView, Proxy);
 				MainViewDesc.LodBiasScale = Proxy->LodBiasScale;
 
@@ -1330,7 +1398,7 @@ void FVirtualHeightfieldMeshRendererExtension::SubmitWork(FRHICommandListImmedia
 				// Submit virtual texture feedback
 				VirtualHeightfieldMesh::AddPass_SubmitFeedbackBuffer(GraphBuilder, VolatileResources, ProxyDesc);
 
-				while (WorkIndex < NumWorkItems && MainViews[WorkDescs[WorkIndex].MainViewIndex] == MainView)
+				while (WorkIndex < NumWorkItems && ViewFamilies[WorkDescs[WorkIndex].MainViewIndex][0] == MainView)
 				{
 					// Gather data per child view
 					FSceneView const* CullView = CullViews[WorkDescs[WorkIndex].CullViewIndex];
@@ -1356,7 +1424,15 @@ void FVirtualHeightfieldMeshRendererExtension::SubmitWork(FRHICommandListImmedia
 					}
 
 					// Build graph
-					VirtualHeightfieldMesh::AddPass_CullInstances(GraphBuilder, GetGlobalShaderMap(GMaxRHIFeatureLevel), ProxyDesc, VolatileResources, Buffers[WorkDescs[WorkIndex].BufferIndex], ChildViewDesc);
+					VirtualHeightfieldMesh::AddPass_CullInstances(
+						GraphBuilder,
+						GetGlobalShaderMap(GMaxRHIFeatureLevel),
+						ProxyDesc,
+						VolatileResources,
+						Buffers[WorkDescs[WorkIndex].BufferIndex],
+						ChildViewDesc,
+						/* Confirm that Main View is for Instanced Stereo Pass AND we currently cull for Main View */
+						MainView->IsInstancedStereoPass() && ChildViewDesc.bIsMainView);
 
 					WorkIndex++;
 				}

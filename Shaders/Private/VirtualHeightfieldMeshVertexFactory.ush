@@ -67,7 +67,8 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 {
 	FVertexFactoryIntermediates Intermediates;
 
-	const QuadRenderInstance Item = InstanceBuffer[Input.InstanceId];
+	// GetInstanceId provides instance selection supporting an Instanced Stereo consumer (see InstancedStereo.ush)
+	const QuadRenderInstance Item = InstanceBuffer[GetInstanceId(Input.InstanceId)];
 	const uint2 Pos = UnpackPos(Item);
 	const uint Level = UnpackLevel(Item);
 	

@@ -48,6 +48,9 @@ float3 UVToWorldScale;
 
 int NumIndices;
 
+uint CullInstancesWorkFlags;
+
+#define FLAG_INSTANCED_STEREO	(1u << 1u)
 
 /** Unpack the virtual level for a PhysicalAddress entry in the virtual texture page table. */
 uint GetVirtualLevelFromPhysicalAddress(uint InPhysicalAddress)
@@ -410,5 +413,13 @@ void CullInstancesCS( uint3 DispatchThreadId : SV_DispatchThreadID )
 		uint Write;
 		InterlockedAdd(RWIndirectArgsBuffer[1], 1, Write);
 		RWInstanceBuffer[Write] = OutInstance;
+
+		// Duplicate instance for an Instanced Stereo consumer
+		const bool InstancedStereoWorkload = (CullInstancesWorkFlags & FLAG_INSTANCED_STEREO) != 0;
+		if (InstancedStereoWorkload)
+		{
+			InterlockedAdd(RWIndirectArgsBuffer[1], 1, Write);
+			RWInstanceBuffer[Write] = OutInstance;
+		}
 	}
 }
