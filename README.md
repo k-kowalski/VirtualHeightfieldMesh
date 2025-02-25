@@ -3,8 +3,13 @@
 
 ## Instanced Stereo Enabled
 
-The main purpose of this fork is to add Instanced Stereo support to Epic Games's VHM plugin.
+The main purpose of this fork is to add **Instanced Stereo Rendering** support to Epic Games's VirtualHeightfieldMesh (VHM) plugin.
+
+![screenshot](docs/VhmIsr.png)
+
+*Demonstrated landscape courtesy of OpenLand.*
 
 ## License
 
-Base work is a property of Epic Games, Inc. and subjected to their appropriate licensing.
+Base plugin is a property of Epic Games, Inc. and subjected to their appropriate licensing.
+
